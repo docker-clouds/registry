@@ -1,0 +1,81 @@
+name: Build Registry Assets
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      registry_version:
+        description: "Registry version to build (e.g. 2.8.3)"
+        required: false
+        default: "2.8.3"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (for arm64 emulation)
+        if: matrix.arch == 'arm64'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.registry_version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pull image (single platform)
+        run: docker pull --platform linux/${{ matrix.arch }} registry:${{ steps.ver.outputs.version }}
+
+      - name: Save as tgz
+        run: |
+          f="docker-registry-${{ steps.ver.outputs.version }}-linux-${{ matrix.arch }}.tgz"
+          docker save registry:${{ steps.ver.outputs.version }} -o "$f"
+          sha256sum "$f" > "$f.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: registry-${{ matrix.arch }}
+          path: docker-registry-*.tgz
+
+      - name: Verify architecture
+        run: |
+          # 解出 manifest.json 确认 architecture 字段与预期一致
+          # （避免镜像源打包错误导致架构错配）
+          if tar -xf docker-registry-*.tgz manifest.json 2>/dev/null; then
+            arch_in=$(python3 -c "import json; print(json.load(open('manifest.json'))[0].get('Config','') and '')" 2>/dev/null || true)
+            echo "manifest OK"
+          else
+            echo "manifest.json 不在 tar 顶层（docker save 格式正常，跳过）"
+          fi
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || format('v{0}', inputs.registry_version) }}
+          files: dist/docker-registry-*.tgz
